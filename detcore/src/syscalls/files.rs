@@ -36,6 +36,8 @@ use tracing::info;
 use tracing::trace;
 use tracing::warn;
 
+use nix::unistd::Pid as Pid;
+
 use crate::config::SchedHeuristic;
 use crate::detlog;
 use crate::dirents::*;
@@ -48,6 +50,82 @@ use crate::stat::*;
 use crate::tool_global::*;
 use crate::tool_local::Detcore;
 use crate::types::*;
+
+use nix::sys::uio::RemoteIoVec;
+use nix::sys::uio::process_vm_writev;
+use std::time::Instant;
+use std::fs::File;
+use std::io;
+use std::io::{SeekFrom, Seek, Read, BufRead, IoSlice};
+use futures::lock::Mutex;
+
+type Snapshot = Vec<(RemoteIoVec, Vec<u8>)>;
+type FullSnapshot = Option<(libc::user_regs_struct, Snapshot)>;
+
+use once_cell::sync::Lazy;
+
+static snappy : Lazy<Mutex<FullSnapshot>> = Lazy::new(||  Mutex::new(None));
+
+fn parse_line(line : &str) -> Option<(u64, u64)> {
+    // TODO: replace with little nom grammar
+    // <address start>-<address end>  <mode>  <offset>   <major id:minor id>   <inode id>
+    // <file path>
+    let mut split = line.split_whitespace();
+    let range : &str = split.next().expect("should have range");
+    let mut range = range.split("-");
+    let start = u64::from_str_radix(range.next().expect("should have start"), 16)
+        .expect("should be hex num");
+    let end = u64::from_str_radix(range.next().expect("should have start"), 16)
+        .expect("should be hex num");
+    let len = end - start;
+
+    let mode = split.next().expect("should have mode");
+
+    if !mode.contains('w') {
+        return None
+    }
+
+    // skip three fields
+    split.next();
+    split.next();
+    split.next();
+    return Some((start, len));
+}
+
+fn take_snapshot(pid : u32) -> Snapshot {
+    let start = Instant::now();
+    let filename = format!("/proc/{pid}/maps");
+    let file = File::open(filename).expect("should open maps");
+    let lines = io::BufReader::new(file).lines();
+    let offsets = lines
+        .filter_map(|l| l.ok())
+        .filter_map(|l| parse_line(&l));
+
+    let mut f = File::open(format!("/proc/{pid}/mem")).expect("should open mem");
+
+    let mut total = 0;
+    let snapshot = offsets.map(|(offset, len)| {
+        total += len;
+        let mut buf = vec![0u8; len as usize];
+        f.seek(SeekFrom::Start(offset)).expect("proc mem should seek");
+        f.read_exact(&mut buf).expect("should read exact");
+        // println!("loc was {:x} to {:x}", offset, offset + len);
+        let loc = RemoteIoVec { base : offset as usize, len : len as usize };
+        (loc, buf)
+    }).collect::<Vec<_>>();
+    println!("snapshot of {:?} kb, {:?} regions in {:?} micros", total/1000, snapshot.len(), start.elapsed().as_micros());
+    return snapshot
+}
+
+fn restore_snapshot(pid : u32, snapshot : &Snapshot) {
+    let start = Instant::now();
+    let (locs, bufs) : (Vec<_>, Vec<_>) = snapshot.iter().map(|(loc, buf)| (*loc, IoSlice::new(buf)))
+        .unzip();
+    process_vm_writev(Pid::from_raw(pid as i32), &bufs[..], &locs[..])
+        .expect("restore failed");
+    println!("restored in {:?} micros", start.elapsed().as_micros());
+}
+
 
 /// A conversion from SOCK_* flags to O_* flags which makes unsafe (but checked during testing) assumptions.
 fn oflag_from_sock_bits(s_bits: i32) -> OFlag {
@@ -166,7 +244,7 @@ impl<T: RecordOrReplay> Detcore<T> {
 
     /// SYS_read system call (MAYHANG).
     pub async fn handle_read<G: Guest<Self>>(
-        &self,
+        & self,
         guest: &mut G,
         call: syscalls::Read,
     ) -> Result<i64, Error> {
@@ -175,6 +253,11 @@ impl<T: RecordOrReplay> Detcore<T> {
             let res = guest.inject(Syscall::from(call)).await?;
             return Ok(res);
         }
+        
+        let r : libc::user_regs_struct = guest.regs().await;
+        info!("DYL READ {} guest, {:?} host", guest.pid(), std::thread::current().id());
+        let s = take_snapshot(guest.pid().as_raw() as u32);
+        { *snappy.lock().await = Some((r, s)); }
 
         let (fd_type, resource) = guest
             .thread_state_mut()
@@ -291,6 +374,13 @@ impl<T: RecordOrReplay> Detcore<T> {
             (detfd.resource.clone(), detfd.stat.map(|x| x.inode))
         })?;
         // It doesn't matter much where the linearization point for this mtime bump falls:
+        let tmp = snappy.lock().await;
+        let (r, s) = tmp.as_ref().unwrap();
+        nix::sys::ptrace::setregs(nix::unistd::Pid::from_raw(guest.pid().as_raw()), r.clone())
+            .expect("should set reg");
+        restore_snapshot(guest.pid().as_raw() as u32, s);
+        drop(tmp);
+        println!("WRITE BABY!");
         if guest.config().virtualize_metadata {
             let r =
                 raw_ino.expect("Expect that when virtualize_metadata, DetFd's stat is populated!");
